@@ -13,8 +13,11 @@ nftldump_LDADD = libmtd.a
 nftl_format_SOURCES = nand-utils/nftl_format.c
 nftl_format_LDADD = libmtd.a
 
+nandtest2_SOURCES = nand-utils/nandtest2.c
+nandtest2_LDADD = libmtd.a
+
 NAND_BINS = \
-	nanddump nandwrite nandtest nftldump nftl_format
+	nanddump nandwrite nandtest nftldump nftl_format nandtest2
 
 NAND_SH = \
 	nand-utils/load_nandsim.sh

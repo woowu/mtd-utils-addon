@@ -37,6 +37,7 @@ mtd_debug
 mtdpart
 nanddump
 nandtest
+nandtest2
 nandwrite
 nftl_format
 nftldump
