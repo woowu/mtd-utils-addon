@@ -18,27 +18,30 @@
 #include "libmtd.h"
 #include "common.h"
 
+#define THIS_VERSION "1.0.1"
+
 static NORETURN void usage(int status)
 {
     fprintf(status ? stderr : stdout,
         "usage: %s [OPTIONS] <device>\n\n"
         "This tool do several passes of NAND flash test.\n"
         "\n"
-        "In each pass, it goes through a given range of blocks of the NAND in\n"
-        "a randomly disturbed order. For each block, it firstly erase it\n"
-        "and then program it with a randomly disturbed sequence of splits of\n"
-        "consecutive pages. The contents of the pages will be filled with\n"
-        "random numbers.\n"
+        "In each pass, it goes through a given range of blocks of the NAND\n"
+        "in a randomly disturbed order. For each block, it firstly erase\n"
+        "it and then program it with a randomly disturbed sequence of splits\n"
+        "of consecutive pages. The contents of the pages will be filled\n"
+        "with random numbers.\n"
         "\n"
-        "For each pass of the test, every block (except the bad blocks) will\n"
-        "be erased just once, but will be read back 2 * 'reads' times for\n"
-        "comparison. Half times of reads will be done just after the block\n"
-        "were fully programmed, another half times of repeated reads will be\n"
-        "done in the end of the pass after all the blocks had been programmed.\n"
+        "For each pass of the test, every block (except the bad blocks) will be\n"
+        "erased just once, but will be read back 2 * n times for comparison.\n"
+        "Half times of reads (n) will be done just after the block were fully\n"
+        "programmed, another half times of repeated reads (n) will be done in\n"
+        "the end of the pass after all the blocks had been programmed.  The 'n'\n"
+        "value is provided from the -r option, default is 3.\n"
         "\n"
         "If erasing of a block failed, the block will be marked bad\n"
         "immediately and if programming of any page failed, the block to\n"
-        "which the page or pages belong to will be marked as bad immediately.\n"
+        "which the page or pages belong to will be marked as bad.\n"
         "\n"
         "Erase or programming errors mean:\n"
         "  - MTD API returned error when doing the operation.\n"
@@ -50,8 +53,15 @@ static NORETURN void usage(int status)
         "    read back copy mismatched.\n"
         "\n"
         "One time of erase/programming error on a block will lead to marking\n"
-        "of bad block if the '-m' option was provided, but only after 'times'\n"
-        "of contentious read error a block can be marked bad.\n"
+        "of bad block if the '-m' option was provided, but after 'n' times\n"
+        "of contentious read error a block can only be marked bad.\n"
+        "\n"
+        "By default, the program will exit whenever in the end of a pass there\n"
+        "are new bad block identified -- despite '-m' specified or not.  This\n"
+        "behavior can be changed by providing -c options, in this way the test\n"
+        "will always continue while new bad blocks might be continuously\n"
+        "developed.\n"
+        "\n"
         "\n"
         "  -h, --help           Display this help output\n"
         "  -V, --version        Display version information and exit\n"
@@ -60,43 +70,113 @@ static NORETURN void usage(int status)
         "  -r <n>, --reads=<n>  Read operation repeats time [default=3]\n"
         "  -s, --start          Start index of block [default=0]\n"
         "  -n, --blocks         number of blocks to test [default=flash blocks number]\n"
-        "  -S, --info-only      Only print MTD information, no test\n",
+        "  -S, --info-only      Only print MTD information, no test\n"
+        "  -c, --countinue      Continue test even new bad block identified in a pass\n",
         PROGRAM_NAME);
     exit(status);
 }
 
-#define UNUSED(x)   (void)(x)
-#define MAX_LINE    200
+#define UNUSED(x)       (void)(x)
+#define MAX_LINE        200
+#define MAX_PATHNAME    128
+
+#define DUMP_REF_PAGE   1
 
 typedef int (* loc_opr_t)(int index, void *data);
 typedef int (* intvl_opr_t)(int a, int b, void *data);
 
 static int nr_passes = 1;
-static uint32_t block_start = 0;
-static uint32_t block_nr = -1;
+static unsigned int block_start = 0;
+static unsigned int block_nr = -1;
+static int continue_test;
+static char *dump_dir;
+static int markbad;
+static int info_only;
+static int verbose;
 
 static struct mtd_info_user meminfo;
 static struct mtd_ecc_stats oldstats, newstats;
 static struct nand_oobinfo oobinfo;
 static int fd;
-static int markbad;
 static libmtd_t mtd_desc;
 static struct mtd_dev_info mtd;
 static unsigned char *bbt;
-static int info_only;
-static int verbose;
 static unsigned int new_badblocks_cnt;
+static unsigned int pages_per_block;
+static int pass;
 
 /**
  * How many time each read  will repeats.
  */
 static int nr_reads = 3;
 
+#define same_block(j, k) ((j) / (pages_per_block) == (k) / (pages_per_block))
+
 /**
  * Seed values each used for a block that generate contents of every page
  * in the block.
  */
 static int *seeds;
+
+static void dump_page(unsigned int page_no, void *data, size_t len, int options)
+{
+    struct stat statbuf;
+    unsigned int suffix;
+    char pathname[MAX_PATHNAME];
+    int dfd;
+    const char *type;
+
+    if (! dump_dir) return;
+
+    memset(pathname, 0, sizeof(pathname));
+    if (options & DUMP_REF_PAGE)
+        type = ".ref";
+    else
+        type = "";
+
+    /* A same page could be dump more than once, hence adding suffix name
+     * if duplication found.
+     */
+
+    snprintf(pathname, MAX_PATHNAME - 1, "%s/%d-page-%u%s",
+            dump_dir, pass + 1, page_no, type);
+    suffix = 0;
+    while (1) {
+        if (stat(pathname, &statbuf)) break;
+        snprintf(pathname, MAX_PATHNAME - 1, "%s/%d-page-%u.%d%s",
+                dump_dir, pass + 1, page_no, suffix, type);
+        ++suffix;
+    }
+
+    if ((dfd = open(pathname, O_CREAT | O_TRUNC | O_WRONLY, 0660)) < 0) {
+        printf("open %s failed: %s\n", pathname, strerror(errno));
+        exit(1);
+    }
+    if (write(dfd, data, len) < 0) {
+        printf("write %s failed: %s\n", pathname, strerror(errno));
+        exit(1);
+    }
+    close(dfd);
+}
+
+static void on_new_bad_block(int block)
+{
+    loff_t ofs;
+
+    if (! bbt[block]) {
+        printf("block %d developed bad\n", block);
+        bbt[block] = 1;
+        ++new_badblocks_cnt;
+    }
+    if (markbad) {
+        printf("mark bad block %d\n", block);
+        ofs = block * meminfo.erasesize;
+        if (ioctl(fd, MEMSETBADBLOCK, &ofs)) {
+            printf("MEMSETBADBLOCK at block %d: %s\n", block, strerror(errno));
+            exit(1);
+        }
+    }
+}
 
 /**
  * Make data buffer of lenght 'len'. The buffer is make up
@@ -140,6 +220,8 @@ static int aligned_read_and_compare(int page_start, int page_end, void *data)
     ssize_t n;
     char *buf, *rbuf;
     int fail_cnt;
+    int success_cnt;
+    int ref_page;
 
     if (make_data_buf(len, seed, &buf)) exit(1);
     if (! (rbuf = malloc(len))) {
@@ -149,8 +231,9 @@ static int aligned_read_and_compare(int page_start, int page_end, void *data)
 
     if (verbose) printf("read page %d to %d\n", page_start, page_end);
 
+    success_cnt = 0;
     fail_cnt = 0;
-    for (int i = 0; i < nr_reads; ++i) {
+    while (success_cnt < nr_reads && fail_cnt < 3) {
         memset(rbuf, 0, len);
         n = pread(fd, rbuf, len, page_start * meminfo.writesize);
         if (n == -1) {
@@ -175,23 +258,80 @@ static int aligned_read_and_compare(int page_start, int page_end, void *data)
             oldstats.corrected = newstats.corrected;
         }
         if (newstats.failed > oldstats.failed) {
-            printf("ecc failed at pages %d to %d\n", page_start, page_end);
             oldstats.failed = newstats.failed;
             ++fail_cnt;
+            printf("ecc failed at pages %d to %d (fail_cnt: %d)\n",
+                    page_start, page_end, fail_cnt);
+            success_cnt = 0;
             continue;
         }
 
         if (memcmp(buf, rbuf, len)) {
-            fprintf(stderr, "page contents read not same as written\n");
             ++fail_cnt;
+            fprintf(stderr, "page contents read not same as written"
+                    " from pages %d to %d (fail_cnt: %d)\n", 
+                    page_start, page_end, fail_cnt);
+            success_cnt = 0;
             continue;
         }
+
+        fail_cnt = 0;
+        ++success_cnt;
+    }
+
+    if (fail_cnt < nr_reads) {
+        free(buf);
+        free(rbuf);
+        return 0;
+    }
+
+    /* Find out failed pages and read back its oob.
+     */
+
+    unsigned char *page_with_oob;
+    if (! (page_with_oob
+                = malloc(meminfo.writesize + mtd.oob_size))) {
+        printf("out of memory in %s\n", __func__);
+        exit(1);
+    }
+
+    for (int i = 0; i < n_pages; ++i) {
+        memset(page_with_oob + meminfo.writesize, 0 , mtd.oob_size);
+        if (mtd_read_oob(mtd_desc, &mtd, fd,
+                    (page_start + i) * meminfo.writesize,
+                    mtd.oob_size, page_with_oob + meminfo.writesize)) {
+            printf("read oob failed at page %d\n", i + page_start);
+            exit(1);
+        }
+        memcpy(page_with_oob, rbuf + i * meminfo.writesize, meminfo.writesize);
+        dump_page(page_start + i, page_with_oob, meminfo.writesize + mtd.oob_size,
+                0);
+    }
+
+    /* Find a reference page in the same block to dump for comparison purpose.
+     * Note: the reference page may also a bad page, but the chance should
+     * be very slow.
+     */
+
+    if ((ref_page = same_block(page_start, page_start - 1)
+        ? page_start - 1
+        : same_block(page_end, page_end + 1)
+        ? page_end + 1
+        : -1) >= 0) {
+
+        memset(page_with_oob, 0 , meminfo.writesize + mtd.oob_size);
+        pread(fd, page_with_oob, meminfo.writesize + mtd.oob_size,
+                ref_page * meminfo.writesize);
+        mtd_read_oob(mtd_desc, &mtd, fd,
+                    ref_page * meminfo.writesize,
+                    mtd.oob_size, page_with_oob + meminfo.writesize);
+        dump_page(ref_page, page_with_oob, meminfo.writesize + mtd.oob_size,
+                DUMP_REF_PAGE);
     }
 
     free(buf);
     free(rbuf);
-
-    return fail_cnt < nr_reads ? 0 : -1;
+    return -1;
 
 fail:
     fflush(stdout);
@@ -208,7 +348,7 @@ static int scan_badblocks(void)
     int err;
 
     if (! oobbuf && ! (oobbuf = malloc(mtd.oob_size))) {
-        fprintf(stderr, "Could not allocate %d bytes for buffer\n",
+        fprintf(stderr, "could not allocate %d bytes for buffer\n",
             mtd.oob_size);
         exit(1);
     }
@@ -331,7 +471,7 @@ static int aligned_write(int page_start, int page_end, void *data)
     if (make_data_buf(len, seed, &buf)) return -1;
 
     if (verbose)
-        printf("write page %d to %d. nr of pages %d\n",
+        printf("write page %d to %d. (%d)\n",
                 page_start, page_end, page_end - page_start + 1);
     n = pwrite(fd, buf, len, page_start * meminfo.writesize);
     if (n == -1) {
@@ -354,8 +494,8 @@ fail:
 
 static int scratch_block(int block)
 {
-    int page_start = block * (meminfo.erasesize / meminfo.writesize);
-    int page_end = page_start + (meminfo.erasesize / meminfo.writesize) - 1;
+    int page_start = block * pages_per_block;
+    int page_end = page_start + pages_per_block - 1;
 
     if (random_tree_walk_split(page_start, page_end, aligned_write,
                 (void *)(long int)seeds[block]))
@@ -370,7 +510,6 @@ static int scratch_block(int block)
 static int write_test_block(int block, void *nouse)
 {
     UNUSED(nouse);
-    loff_t ofs;
 
     if (bbt[block]) {
         printf("skip bad block %d\n", block);
@@ -380,23 +519,14 @@ static int write_test_block(int block, void *nouse)
     if (! erase_block(block) && ! scratch_block(block))
         return 0;
 
-    if (markbad) {
-        printf("mark bad block %d\n", block);
-        ofs = block * meminfo.erasesize;
-        if (ioctl(fd, MEMSETBADBLOCK, &ofs)) {
-            printf("MEMSETBADBLOCK at block %d: %s\n", block, strerror(errno));
-            exit(1);
-        }
-        bbt[block] = 1;
-        ++new_badblocks_cnt;
-    }
+    on_new_bad_block(block);
     return 0;
 }
 
 static int read_compare_block(int block)
 {
-    int page_start = block * (meminfo.erasesize / meminfo.writesize);
-    int page_end = page_start + (meminfo.erasesize / meminfo.writesize) - 1;
+    int page_start = block * pages_per_block;
+    int page_end = page_start + pages_per_block - 1;
 
     if (random_tree_walk_split(page_start, page_end, aligned_read_and_compare,
                 (void *)(long int)seeds[block]))
@@ -408,7 +538,6 @@ static int read_compare_block(int block)
 static int read_test_block(int block, void *nouse)
 {
     UNUSED(nouse);
-    loff_t ofs;
 
     if (bbt[block]) {
         printf("skip bad block %d\n", block);
@@ -417,16 +546,7 @@ static int read_test_block(int block, void *nouse)
     if (! read_compare_block(block))
         return 0;
 
-    if (markbad) {
-        printf("mark bad block %d\n", block);
-        ofs = block * meminfo.erasesize;
-        if (ioctl(fd, MEMSETBADBLOCK, &ofs)) {
-            printf("MEMSETBADBLOCK at block %d: %s\n", block, strerror(errno));
-            exit(1);
-        }
-        bbt[block] = 1;
-        ++new_badblocks_cnt;
-    }
+    on_new_bad_block(block);
     return 0;
 }
 
@@ -457,8 +577,8 @@ static void parse_cmdline(int argc, char **argv)
 {
     int error = 0;
 
-    for (;;) {
-        static const char short_options[] = "hn:ms:p:r:VSv";
+    while (1) {
+        static const char short_options[] = "hn:ms:p:r:d:VScv";
         static const struct option long_options[] = {
             { "help", no_argument, 0, 'h' },
             { "version", no_argument, 0, 'V' },
@@ -468,6 +588,8 @@ static void parse_cmdline(int argc, char **argv)
             { "blocks", required_argument, 0, 'n' },
             { "reads", required_argument, 0, 'r' },
             { "info-only", no_argument, 0, 'S' },
+            { "continue", no_argument, 0, 'c' },
+            { "dump-dir", required_argument, 0, 'd' },
             { "verbose", no_argument, 0, 'v' },
             {0, 0, 0, 0},
         };
@@ -480,7 +602,7 @@ static void parse_cmdline(int argc, char **argv)
         case 'h':
             usage(EXIT_SUCCESS);
         case 'V':
-            common_print_version();
+            printf(THIS_VERSION "\n");
             exit(EXIT_SUCCESS);
             break;
         case '?':
@@ -510,6 +632,14 @@ static void parse_cmdline(int argc, char **argv)
             info_only = 1;
             break;
 
+        case 'c':
+            continue_test = 1;
+            break;
+
+        case 'd':
+            dump_dir = optarg;
+            break;
+
         case 'v':
             verbose = 1;
             break;
@@ -523,6 +653,12 @@ static void parse_cmdline(int argc, char **argv)
     if (markbad && nr_reads < 3) {
         fflush(stdout);
         fprintf(stderr, "reads must not less three when markbad is set\n");
+        exit(1);
+    }
+
+    struct stat statbuf;
+    if (dump_dir && stat(dump_dir, &statbuf)) {
+        fprintf(stderr, "cannot open dir %s\n", dump_dir);
         exit(1);
     }
 }
@@ -568,11 +704,14 @@ static void open_device(const char *filename)
         exit(1);
     }
 
-    printf("memory: type %u flags 0x%x size %u erasesize %u writesize %u oobsize %u\n",
+    pages_per_block = meminfo.erasesize / meminfo.writesize;
+
+    printf("memory: type %u flags 0x%x size %u\n"
+           "  terasesize %u writesize %u oobsize %u\n",
             meminfo.type, meminfo.flags, meminfo.size, meminfo.erasesize,
             meminfo.writesize, meminfo.oobsize); 
-    printf("mtd: size %lld eb_cnt %d eb_size %d min_io_size %d"
-            " subpage_size %d oob_size %d bb_allowed %d\n",
+    printf("mtd: size %lld eb_cnt %d eb_size %d min_io_size %d\n"
+           "  subpage_size %d oob_size %d bb_allowed %d\n",
             mtd.size, mtd.eb_cnt, mtd.eb_size, mtd.min_io_size,
             mtd.subpage_size, mtd.oob_size, mtd.bb_allowed);
     printf("oob: useecc %d eccbytes %u\n", oobinfo.useecc, oobinfo.eccbytes);
@@ -586,26 +725,33 @@ static void open_device(const char *filename)
 static int one_pass(void)
 {
     int *p = seeds;
+    unsigned int prev_cnt;
+    unsigned int block_end;
+
+    block_end = block_start + block_nr - 1 > mtd.eb_cnt - 1
+        ? mtd.eb_cnt - 1 : block_start + block_nr - 1;
 
     srand(time(NULL));
     for (int j = 0; j < mtd.eb_cnt; j++) *p++ = rand();
 
     srandom(time(NULL));
+    prev_cnt = new_badblocks_cnt;
 
-    random_tree_walk(block_start, block_start + block_nr - 1,
-            write_test_block, NULL);
+    printf("testing %u blocks\n", block_end - block_start + 1);
+    random_tree_walk(block_start, block_end, write_test_block, NULL);
 
-    /* Previously after each writing of a block, a read check was done that
+    /* Previously after each writing of a block, a read check had done for that
      * block. This time, after all the blocks had been written, another
      * independent read check will be done on the whole range of blocks.
      */
-    random_tree_walk(block_start, block_start + block_nr - 1,
-            read_test_block, NULL);
+    printf("post check\n");
+    random_tree_walk(block_start, block_end, read_test_block, NULL);
 
     fflush(stdout);
 
-    if (new_badblocks_cnt) {
-        printf("%u new bad blocks marked.\n", new_badblocks_cnt);
+    if (new_badblocks_cnt > prev_cnt) {
+        printf("%u new bad blocks developed.\n",
+                new_badblocks_cnt - prev_cnt);
         return -1;
     }
 
@@ -634,16 +780,19 @@ int main(int argc, char **argv)
         goto fail;
     }
 
-    for (int i = 0; i < nr_passes; ++i) {
-        printf("start pass %d\n", i + 1);
-        if (one_pass() && i + 1 < nr_passes) {
-            printf("skipped remaining %d test passes\n", nr_passes - i - 1);
+    for (pass = 0; pass < nr_passes; ++pass) {
+        printf("-- start pass %d\n", pass + 1);
+        if (one_pass() && ! continue_test && pass + 1 < nr_passes) {
+            printf("skipped remaining %d test passes\n", nr_passes - pass - 1);
             break;
         }
     }
 
+    printf("-- test end\n");
     get_ecc_info();
     close(fd);
+    if (new_badblocks_cnt)
+        printf("ttl %d new bad blocks developed\n", new_badblocks_cnt);
     exit(new_badblocks_cnt ? 1 : 0);
 
 fail:
