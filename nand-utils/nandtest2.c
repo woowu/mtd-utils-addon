@@ -76,11 +76,13 @@ static NORETURN void usage(int status)
     exit(status);
 }
 
-#define UNUSED(x)       (void)(x)
-#define MAX_LINE        200
-#define MAX_PATHNAME    128
+#define UNUSED(x)           (void)(x)
+#define MAX_LINE            200
+#define MAX_PATHNAME        128
 
-#define DUMP_REF_PAGE   1
+#define DUMP_REF_PAGE       1
+#define MAX_READ_FAILS      3
+#define MAX_SPLIT_SIZE       30
 
 typedef int (* loc_opr_t)(int index, void *data);
 typedef int (* intvl_opr_t)(int a, int b, void *data);
@@ -233,7 +235,7 @@ static int aligned_read_and_compare(int page_start, int page_end, void *data)
 
     success_cnt = 0;
     fail_cnt = 0;
-    while (success_cnt < nr_reads && fail_cnt < 3) {
+    while (success_cnt < nr_reads && fail_cnt < MAX_READ_FAILS) {
         memset(rbuf, 0, len);
         n = pread(fd, rbuf, len, page_start * meminfo.writesize);
         if (n == -1) {
@@ -437,12 +439,13 @@ static int random_tree_walk(int from, int to, loc_opr_t opr, void *data)
 static int random_tree_walk_split(int from, int to, intvl_opr_t opr, void *data)
 {
     int err;
-    int a, b;
+    int a, b, c;
 
     if (from > to) return 0;
 
     a = (random() % (to - from + 1)) + from;
-    b = (random() % (to - a + 1)) + a;
+    c = a + MAX_SPLIT_SIZE - 1 > to ? to : a + MAX_SPLIT_SIZE - 1;
+    b = (random() % (c - a + 1)) + a;
 
     if ((err = opr(a, b, data))) return err;
 
@@ -471,7 +474,7 @@ static int aligned_write(int page_start, int page_end, void *data)
     if (make_data_buf(len, seed, &buf)) return -1;
 
     if (verbose)
-        printf("write page %d to %d. (%d)\n",
+        printf("write page %d to %d. nr=%d\n",
                 page_start, page_end, page_end - page_start + 1);
     n = pwrite(fd, buf, len, page_start * meminfo.writesize);
     if (n == -1) {
