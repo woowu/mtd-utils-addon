@@ -63,15 +63,16 @@ static NORETURN void usage(int status)
         "developed.\n"
         "\n"
         "\n"
-        "  -h, --help           Display this help output\n"
-        "  -V, --version        Display version information and exit\n"
-        "  -m, --markbad        Mark blocks bad if they appear so\n"
-        "  -p, --passes         Number of passes [default=1]\n"
-        "  -r <n>, --reads=<n>  Read operation repeats time [default=3]\n"
-        "  -s, --start          Start index of block [default=0]\n"
-        "  -n, --blocks         number of blocks to test [default=flash blocks number]\n"
-        "  -S, --info-only      Only print MTD information, no test\n"
-        "  -c, --countinue      Continue test even new bad block identified in a pass\n",
+        "  -h, --help                   Display this help output\n"
+        "  -V, --version                Display version information and exit\n"
+        "  -m, --markbad                Mark blocks bad if they appear so\n"
+        "  -p <n>, --passes=<n>         Number of passes [default=1]\n"
+        "  -r <n>, --reads=<n>          Read operation repeats time [default=3]\n"
+        "  -s, --start                  Start index of block [default=0]\n"
+        "  -n <n>, --blocks=<n>         number of blocks to test [default=flash blocks number]\n"
+        "  -d=<dir>, --dump-dir=<dir>   A directory to dump read-back pages when read failed\n"
+        "  -S, --info-only              Only print MTD information, no test\n"
+        "  -c, --countinue              Continue test even new bad block identified in a pass\n",
         PROGRAM_NAME);
     exit(status);
 }
